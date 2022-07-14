@@ -1,98 +1,110 @@
 import argparse
-import os
 import sys
 from io import StringIO
 from dotenv import load_dotenv
 from tenable.sc import TenableSC
-from pprint import pprint
 
-parser = argparse.ArgumentParser()
-parser.add_argument('-s', '--source-repository', help='read ips from this repository')
-parser.add_argument('-t', '--target-repository', help='delete matching ips from this repository')
-args = parser.parse_args()
+class RepositoryNotFound(Exception):
+    pass
+
+class RepositoryWrongType(Exception):
+    pass
+
+class BadInput(Exception):
+    pass
 
 load_dotenv()
 
-user_access_key = os.getenv('TSC_ACCESS_KEY')
-user_secret_key = os.getenv('TSC_SECRET_KEY')
-admin_access_key = os.getenv('TSC_ADMIN_ACCESS_KEY')
-admin_secret_key = os.getenv('TSC_ADMIN_SECRET_KEY')
+nessus_template_file='template.nessus'
+    
 
-access_key = user_access_key
-secret_key = user_secret_key
-
-def use_admin_key(value: bool=True):
-    global access_key
-    global secret_key
-    if value:
-        os.environ['TSC_ACCESS_KEY'] = admin_access_key
-        os.environ['TSC_SECRET_KEY'] = admin_secret_key
-        access_key = admin_access_key
-        secret_key = admin_secret_key
+def update_asset_list(sc: TenableSC, name: str, ip_list: list):
+    asset_lists = sc.asset_lists.list()
+    matching_lists = [a for a in asset_lists['manageable'] if a['name'] == name]
+    if matching_lists:
+        asset_list = matching_lists.pop()
+        sc.asset_lists.edit(id=int(asset_list['id']), ips=ip_list)
+        print(f'updated asset_list: {name}')
     else:
-        os.environ['TSC_ACCESS_KEY'] = user_access_key
-        os.environ['TSC_SECRET_KEY'] = user_secret_key
-        access_key = user_access_key
-        secret_key = user_secret_key
-
-# import requests
-# import urllib3
-# from pprint import pprint
-
-# urllib3.disable_warnings()
-
-# access_key = os.getenv('TSC_ADMIN_ACCESS_KEY')
-# secret_key = os.getenv('TSC_ADMIN_SECRET_KEY')
-
-# headers = {
-#     'x-apikey': f'accessKey={access_key}; secretKey={secret_key}'
-# }
-# repos = requests.get('https://127.0.0.1:8443/rest/repository?type=All', headers=headers, verify=False)
-# pprint(repos.json())
+        asset_list = sc.asset_lists.create(name, list_type='static', ips=ip_list)
+        print(f'created asset_list: {name}')
+    
+        
+def get_repository_ips(sc: TenableSC, repository: dict) -> list:
+    # get a list of IPv4 addresses from the repository
+    repository_filter = [int(repository['id'])]
+    findings = sc.analysis.vulns(('repository', '=', repository_filter), tool='sumip')
+    return [record['ip'] for record in findings]
 
 
-template_file='template.nessus'
-sc_host = '127.0.0.1'
-sc_port = 8443
+def delete_from_repository(sc: TenableSC, repository: dict, ip_list: list) -> None:
+    # combine the nessus template file with the desired targets
+    global nessus_template_file
+    with open(nessus_template_file, 'r') as fp:
+        nessus_template = fp.read()
+    nessus_file_str = nessus_template.format(TARGET_IPS=','.join(ip_list))
 
-sc = TenableSC(host=sc_host, port=sc_port)
+    # upload the empty scan results for the ips into the target repository
+    sc.scan_instances.import_scan(StringIO(nessus_file_str), repo=int(repository['id']))
 
-repositories = {repo['name']: repo for repo in sc.repositories.list()}
 
-pprint(repositories['Agents'])
-pprint(repositories[args.target_repository])
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-f', '--input-file', help='read ips from this file')
+    parser.add_argument('-i', '--input-repository', help='read ips from this repository, ignored when --input-file is used')
+    parser.add_argument('-t', '--target-repository', help='delete matching ips from this repository')
+    parser.add_argument('-l', '--list', action='store_true', help='list ips with -f or -i, otherwise list repository names then exit')
+    parser.add_argument('-a', '--update-asset-list', help='create or update a static asset list (replacing contents with the input IPs)')
+    parser.add_argument('-s', '--tsc-server', required=True, help='Tenable.sc hostname or ip address')
+    parser.add_argument('-p', '--tsc-port', default=443, help='Tenable.sc port')
+    args = parser.parse_args()
 
-# identify source repository to read IPs targets
-source_repo = repositories.get(args.source_repository)
-if not source_repo:
-    sys.exit(f'{args.source_repository} not found')
-elif source_repo['dataFormat'] != 'agent':
-    sys.exit(f'{args.source_repository} must be an agent repository')
+    sc = TenableSC(host=args.tsc_server, port=args.tsc_port)
+    
+    repositories = {repo['name']: repo for repo in sc.repositories.list()}
 
-# identify target repository to delete matching IPs 
-target_repo = repositories.get(args.target_repository)
-if not target_repo:
-    sys.exit(f'{args.target_repository} not found')
-elif target_repo['dataFormat'] != 'IPv4':
-    sys.exit(f'{args.target_repository} must be an IPv4 repository')
+    if args.input_file:
+        # get the ip_list from a file
+        with open(args.input_file) as fp:
+            ip_list = ','.join([
+                line.strip().replace(' ', '') for line in fp.readlines()
+            ]).split(',')
+        print(f'reading from {args.input_file}')
+    
+    elif args.input_repository:
+        # get the ip_list from the input_repo
+        input_repo = repositories.get(args.input_repository)
+        if not input_repo:
+            raise RepositoryNotFound(f'{args.input_repository} not found')
 
-print(f'source: [{source_repo["id"]}] {source_repo["name"]}')
-print(f'target: [{target_repo["id"]}] {target_repo["name"]}')
+        ip_list = get_repository_ips(sc, input_repo)
+        print(f'read {len(ip_list)} IP addresses from {args.input_repository}')
 
-# get the target IPs from the source repository
-repository_filter = [int(source_repo['id'])]
-source_findings = sc.analysis.vulns(('repository', '=', repository_filter), tool='sumip')
+    if args.target_repository:
+        # remove IPs from target_repository
+        if not ip_list:
+            raise BadInput('input IP addresses not specified')
 
-ip_list = [record['ip'] for record in source_findings]
-targets = ','.join(ip_list)
-print(f'identified {len(ip_list)} targets: {targets}')
+        target_repo = repositories.get(args.target_repository)
+        if not target_repo:
+            raise RepositoryNotFound(f'{args.target_repository} not found')
+        elif target_repo['dataFormat'] != 'IPv4':
+            raise RepositoryWrongType(f'{args.target_repository} must be an IPv4 repository')
 
-# combine the nessus template file with the desired targets
+        print(f'deleting from {args.target_repository}')
+        delete_from_repository(sc, target_repo, ip_list)
 
-# with open(template_file, 'r') as fp:
-#     nessus_template = fp.read()
-# nessus_file_str = nessus_template.format(TARGET_IPS=targets)
+    if args.update_asset_list:
+        # create or update a static asset list
+        if not ip_list:
+            raise BadInput('input IP addresses not specified')
 
-# upload the 'scan results' to the target repository
-# sc.scan_instances.import_scan(StringIO(nessus_file_str), target_repo['id'])
+        update_asset_list(sc, args.update_asset_list, ip_list)
 
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        print(repr(e))
