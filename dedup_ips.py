@@ -63,6 +63,7 @@ def main():
     
     repositories = {repo['name']: repo for repo in sc.repositories.list()}
 
+    # inputs: source for IPs is either input_file or input_repository
     if args.input_file:
         # get the ip_list from a file
         with open(args.input_file) as fp:
@@ -70,7 +71,7 @@ def main():
                 line.strip().replace(' ', '') for line in fp.readlines()
             ]).split(',')
         print(f'reading from {args.input_file}')
-    
+
     elif args.input_repository:
         # get the ip_list from the input_repo
         input_repo = repositories.get(args.input_repository)
@@ -80,6 +81,7 @@ def main():
         ip_list = get_repository_ips(sc, input_repo)
         print(f'read {len(ip_list)} IP addresses from {args.input_repository}')
 
+    # actions: remove input IPs from target repository and/or update static asset list
     if args.target_repository:
         # remove IPs from target_repository
         if not ip_list:
@@ -100,6 +102,8 @@ def main():
             raise BadInput('input IP addresses not specified')
 
         update_asset_list(sc, args.update_asset_list, ip_list)
+
+    print("complete.")
 
 
 
