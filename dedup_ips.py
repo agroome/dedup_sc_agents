@@ -53,10 +53,11 @@ def main():
     parser.add_argument('-f', '--input-file', help='read ips from this file')
     parser.add_argument('-i', '--input-repository', help='read ips from this repository, ignored when --input-file is used')
     parser.add_argument('-t', '--target-repository', help='delete matching ips from this repository')
-    parser.add_argument('-l', '--list', action='store_true', help='list ips with -f or -i, otherwise list repository names then exit')
+    parser.add_argument('-l', '--limit', type=int, default=500, help='limited on the number of IPs selected for removal')
     parser.add_argument('-a', '--update-asset-list', help='create or update a static asset list (replacing contents with the input IPs)')
     parser.add_argument('-s', '--tsc-server', required=True, help='Tenable.sc hostname or ip address')
     parser.add_argument('-p', '--tsc-port', default=443, help='Tenable.sc port')
+    parser.add_argument('--dry-run', action='store_true', help='run without making changes')
     args = parser.parse_args()
 
     sc = TenableSC(host=args.tsc_server, port=args.tsc_port)
@@ -70,7 +71,7 @@ def main():
             ip_list = ','.join([
                 line.strip().replace(' ', '') for line in fp.readlines()
             ]).split(',')
-        print(f'reading from {args.input_file}')
+        print(f'read {len(ip_list)} IP addresses from {args.input_file}')
 
     elif args.input_repository:
         # get the ip_list from the input_repo
@@ -79,6 +80,7 @@ def main():
             raise RepositoryNotFound(f'{args.input_repository} not found')
 
         ip_list = get_repository_ips(sc, input_repo)
+
         print(f'read {len(ip_list)} IP addresses from {args.input_repository}')
 
     # actions: remove input IPs from target repository and/or update static asset list
@@ -93,8 +95,24 @@ def main():
         elif target_repo['dataFormat'] != 'IPv4':
             raise RepositoryWrongType(f'{args.target_repository} must be an IPv4 repository')
 
-        print(f'deleting from {args.target_repository}')
-        delete_from_repository(sc, target_repo, ip_list)
+        # reduce ip_list to IPs that actually exist in target_repo
+        target_ips = set(get_repository_ips(sc, target_repo)).intersection(ip_list)
+        num_targets = len(target_ips)
+        plural = '' if num_targets == 1 else 'es'
+        print(f'{num_targets} match{plural} in {args.target_repository} repository')
+        if num_targets > args.limit:
+            print(f"number of targets exceeds limit, limiting to {args.limit} results")
+
+        # only use up to a max of limit
+        target_ips = list(target_ips)[:args.limit]
+
+        if num_targets > 0:
+            if args.dry_run:
+                print("DRY RUN")
+                print(f'would have deleted {len(target_ips)} from {args.target_repository} repository')
+            else:
+                print(f'deleting {len(target_ips)} from {args.target_repository} repository')
+                delete_from_repository(sc, target_repo, list(target_ips))
 
     if args.update_asset_list:
         # create or update a static asset list
